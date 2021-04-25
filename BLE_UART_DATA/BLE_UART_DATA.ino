@@ -9,6 +9,13 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include "EMGFilters.h"
+
+EMGFilters myFilter_1;
+
+SAMPLE_FREQUENCY sampleRate = SAMPLE_FREQ_1000HZ;
+
+NOTCH_FREQUENCY humFreq = NOTCH_FREQ_60HZ;
 
 Adafruit_MPU6050 mpu;
 

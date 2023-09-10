@@ -4,57 +4,66 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Wire.h>
-#include "MAX30105.h"
-
-
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include "EMGFilters.h"
+#include "MAX30105.h"
+#include "Decision_tree.h"
+//#include "PPGFilters.h"
 
+//PPGFilters filter;
+
+
+Eloquent::ML::Port::DecisionTree clf;
+
+Adafruit_MPU6050 mpu;
 EMGFilters myFilter_1;
+MAX30105 particleSensor;
 
 SAMPLE_FREQUENCY sampleRate = SAMPLE_FREQ_1000HZ;
 
 NOTCH_FREQUENCY humFreq = NOTCH_FREQ_60HZ;
 
-Adafruit_MPU6050 mpu;
+//sample rate for ppg
+//SAMPLE_FREQUENCY sampleRate1 = SAMPLE_FREQ_50HZ;
 
-
-int len;
 BLEServer *pServer = NULL;
 BLECharacteristic * pTxCharacteristic;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 uint8_t txValue = 0;
-int count=0;
-String v;
+
 unsigned long int current_time=0;
 unsigned long int prev_time=0;
-int IMU_counter = 0;
-int EMG_cnt =0;
-int Hr_cnt=0;
-
-// See the following for generating UUIDs:
-// https://www.uuidgenerator.net/
 
 #define SERVICE_UUID           "0365a300-8d69-4066-80c7-554298a6ec5e" // UART service UUID
 #define CHARACTERISTIC_UUID_RX "021b52d0-d4f6-4085-b91c-2eb99b1fab00"
 #define CHARACTERISTIC_UUID_TX "cf01c075-cb75-4dea-819e-2a79dd466bcb"
 
-
-MAX30105 particleSensor;
 hw_timer_t * timer1 = NULL;
 portMUX_TYPE timerMux1 = portMUX_INITIALIZER_UNLOCKED;
 volatile int interruptCounter1;
+float feat[8];
 
-int str_len ; 
-const int HR_addr = 0x57;  //I2C address of MAX30102
-
-//const int MPU_addr=0x68;  // I2C address of the MPU-6050
 const int SensorInputPin_1=39; // input pin number for EMG
-int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
 
+int32_t e_sum=0;
+int e_count=0,e_zc=0;
+float e_prev=0;
+float e_val;
+bool callibrated=0;
+int avg=0;
+float thresh;
+float e_energy=0;
+float ax,ay,az,Tmp,gx,gy,gz;
+float e_acm,e_gcm,a_max=0,g_max=0;
+float a_energy=0,g_energy=0,acm,gcm;
+//int e_zc=0;
 
+float IR;
+float RED;
+float ir_max=0;
+float r_max=0;
 
 void IRAM_ATTR onTimer1(){
   // Critical Code here
@@ -93,9 +102,10 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 };
 
 
-void setup() {
-   Serial.begin(115200);
-  //pinMode(SensorInputPin_1,INPUT);
+void setup()
+{     
+  
+  Serial.begin(115200);
   
   Serial.println("start timer 1");
   timer1 = timerBegin(1, 80, true);  // timer 1, MWDT clock period = 12.5 ns * TIMGn_Tx_WDT_CLK_PRESCALE -> 12.5 ns * 80 -> 1000 ns = 1 us, countUp
@@ -103,13 +113,10 @@ void setup() {
   timerAlarmWrite(timer1, 1100, true); // 1 ms(EMG rate,1khz), autoreload true
   timerAlarmEnable(timer1); // enable
 
+   //ppg filter
+   filter.init(sampleRate1, humFreq,false,true, true);
 
-  Serial.println("Initializing...");
-
-   while (!Serial)
-    delay(10); // will pause Zero, Leonardo, etc until serial console opens
-
-  Serial.println("Adafruit MPU6050 test!");
+   Serial.println("Adafruit MPU6050 test!");
 
   // Try to initialize!
   if (!mpu.begin()) 
@@ -120,13 +127,16 @@ void setup() {
               }
   }
   Serial.println("MPU6050 Found!");
-
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-  
- 
   mpu.setGyroRange(MPU6050_RANGE_250_DEG);
- // Initialize HR sensor
-  Serial.println("MAX30105 Basic Readings Example");
+  
+  myFilter_1.init(sampleRate, humFreq, true, true, true);
+  Serial.println("PLACE YOUR SENSOR...");
+
+   while (!Serial)
+    delay(10); // will pause Zero, Leonardo, etc until serial console opens
+
+    Serial.println("MAX30105 Basic Readings Example");
 
   // Initialize sensor
   if (particleSensor.begin() == false)
@@ -143,16 +153,9 @@ void setup() {
   int pulseWidth = 411; //Options: 69, 118, 215, 411
   int adcRange = 16384; //Options: 2048, 4096, 8192, 16384
 ////
- particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure senso
-//  particleSensor.setup(); //Configure sensor with default settings
-//  particleSensor.setPulseAmplitudeRed(0x0A); //Turn Red LED to low to indicate sensor is running
-//  particleSensor.setPulseAmplitudeGreen(0); //Turn off Green LED
-  //particleSensor.setSampleRate(100);
-
-
-
-  // Create the BLE Device
-  BLEDevice::init("UART Service");
+ particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); 
+   // Create the BLE Device
+  BLEDevice::init("Epicare");
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
@@ -163,16 +166,16 @@ void setup() {
 
   // Create a BLE Characteristic
   pTxCharacteristic = pService->createCharacteristic(
-										CHARACTERISTIC_UUID_TX,
-										BLECharacteristic::PROPERTY_NOTIFY
-									);
+                   CHARACTERISTIC_UUID_TX,
+                    BLECharacteristic::PROPERTY_NOTIFY
+                  );
                       
   pTxCharacteristic->addDescriptor(new BLE2902());
 
   BLECharacteristic * pRxCharacteristic = pService->createCharacteristic(
-											 CHARACTERISTIC_UUID_RX,
-											BLECharacteristic::PROPERTY_WRITE
-										);
+                       CHARACTERISTIC_UUID_RX,
+                      BLECharacteristic::PROPERTY_WRITE
+                    );
 
   pRxCharacteristic->setCallbacks(new MyCallbacks());
 
@@ -183,30 +186,90 @@ void setup() {
   pServer->getAdvertising()->start();
   Serial.println("Waiting a client connection to notify...");
   prev_time= millis();
+
+
+  
 }
 
 void KHZ() 
 { EMG();
-  if(interruptCounter1%20==0)
-  {HR();
-  IMU();
-  v+="\0";
-  len=v.length() + 1;
-  char c[len];
-  v.toCharArray(c,len);
-  //Serial.println(c);
-  pTxCharacteristic->setValue(c);
-  pTxCharacteristic->notify();        
-  v="";
-  memset(c, 0, sizeof(c)); 
+
+if(e_count%10000==0 && callibrated==0)
+    { //avg=e_sum/e_count;
+      
+      if(avg<200)
+            { callibrated=1;
+            thresh=avg;
+           //String  v="Callibrated";
+          //int len=v.length() + 1;
+          //char c[len];
+          //v.toCharArray(c,len);
+          //Serial.println(c);
+          int v=1;
+          pTxCharacteristic->setValue((uint8_t*)&v,1);
+          pTxCharacteristic->notify();        
+          //v="";
+          //memset(c, 0, sizeof(c)); 
+            //e_count=0;
+            //Serial.print("Callibrated :  ");Serial.println(thresh);
+            
+            }
+      else
+      {
+        int v=0;
+          pTxCharacteristic->setValue((uint8_t*)&v,1);
+          pTxCharacteristic->notify();
+        //Serial.print("AVG :  ");Serial.println(avg);
+      }
+      e_sum=0;
+      e_count=0;
+    }
+else if(callibrated==1)
+{//Serial.print("Callibrated :  ");Serial.println(thresh);
+  //Serial.println(e_count%1000);
+  int v=1;
+  pTxCharacteristic->setValue((uint8_t*)&v,1);
+ pTxCharacteristic->notify(); 
+  if(e_count%20==0)
+  { 
+    IMU();
+    HR();
+  if(e_count%1000==0)
+  { //Serial.print("energy : "); Serial.print(e_energy);Serial.print(" , zc :  "); Serial.println(e_zc);
+  //Serial.print("energy acm: "); Serial.print(a_energy);Serial.print(" , energy gcm :  "); Serial.print(g_energy);
+  //Serial.print(" , max a :  "); Serial.print(a_max);Serial.print(" , max g:  "); Serial.println(g_max);
+    feat[0]=ir_max;
+    feat[1]=r_max;
+    feat[7]= e_zc;
+    feat[6]= e_energy;
+    feat[5]= a_energy;
+    feat[4]= g_energy;
+    feat[3]= a_max;
+    feat[2]= g_max;
+    Serial.print(clf.predict(feat));
+    
+  e_energy=0;
+  e_zc=0;
+  e_count=0;
+  e_prev=0;
+  a_max=0;g_max=0;a_energy=0;g_energy=0;
+  ir_max=0;
+  r_max=0;
+  }
   }
 }
+else
+{         int v=0;
+          pTxCharacteristic->setValue((uint8_t*)&v,1);
+          pTxCharacteristic->notify();
+}
 
-void loop() {
-  current_time= millis();
-    // notify changed value
-  //if(current_time-prev_time<2000)
-  while(1)
+}
+
+
+void loop()
+{
+    while(1)
   { 
     if (deviceConnected) 
     {
@@ -233,30 +296,59 @@ void loop() {
         oldDeviceConnected = deviceConnected;
         }
  }
-//  else
-//  { 
-//
-//    Serial.println(EMG_cnt);Serial.println(Hr_cnt);Serial.println(IMU_counter);
-//    Serial.println(current_time-prev_time);
-//    delay(2000000);
-//  }
-    
+   
 }
 
 void EMG()
-{ v+="e"+String(analogRead(SensorInputPin_1))+",";
-  //EMG_cnt=EMG_cnt+1;
+{ 
+  if (callibrated==0)
+ { e_val=myFilter_1.update(analogRead(SensorInputPin_1));
+  //Serial.println(e_val);
+  e_count=e_count+1;
+  e_sum=(abs(e_val)+e_sum);
+  avg=e_sum/e_count;
+ }
+ else
+ {  
+  e_val=myFilter_1.update(analogRead(SensorInputPin_1));
+  e_val=e_val-thresh;
+  //Serial.println(e_val);
+  e_energy=sq(e_val)+e_energy;;
+  
+  
+ 
+ if(e_val *e_prev<0 && abs(e_val-e_prev)>=1.5*thresh)
+  {
+    e_zc=e_zc+1;
+    
+  }
+   e_prev=e_val;
+   e_count=e_count+1;
+}
 }
 
 void IMU()
 { sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-
-  v+="ax"+String(a.acceleration.x)+","+"ay"+String(a.acceleration.y)+","+"az"+String(a.acceleration.z)+",";
-  v+="gx"+String(g.gyro.x)+","+"gy"+String(g.gyro.y)+","+"gz"+String(g.gyro.z)+",";
-  //IMU_counter=IMU_counter+1;
+  ax=a.acceleration.x;
+  ay=a.acceleration.y;
+  az=a.acceleration.z;
+  gx=g.gyro.x;
+  gy=g.gyro.y;
+  gz=g.gyro.z;
+  acm= sqrt(sq(ax)+sq(ay)+sq(az));
+  gcm= sqrt(sq(gx)+sq(gy)+sq(gz));
+  a_energy=acm+a_energy;
+  g_energy=gcm+g_energy;
+  a_max=(a_max>acm)?a_max:acm;
+  g_max=(g_max>gcm)?g_max:gcm;
 }
+
 void HR()
-{ v+="IR"+String(particleSensor.getIR())+","+"RED"+String(particleSensor.getRed())+",";
-  //Hr_cnt=Hr_cnt+1;  
+{ 
+  IR = lo(particleSensor.getIR());
+  RED = filter.update(particleSensor.getRed());
+  
+  ir_max=(ir_max > IR)?ir_max:IR;
+  r_max=(r_max > RED)?r_max:RED;
 }

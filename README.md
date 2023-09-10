@@ -1,5 +1,5 @@
-# Codes
-Fyp Codes
+# Fyp Codes
+
 
 Wearable Eppilepsy Monitoring Band Code Repo
 
